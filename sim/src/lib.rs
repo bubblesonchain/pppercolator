@@ -5,7 +5,10 @@
 //! Heap-free, so the browser build needs nothing but `core`.
 #![cfg_attr(target_arch = "wasm32", no_std)]
 
+#[cfg(target_arch = "wasm32")]
 use core::cell::UnsafeCell;
+#[cfg(not(target_arch = "wasm32"))]
+use std::cell::RefCell;
 use core::fmt::Write;
 use percolator::{
     AutoCrankObservationV16, AutoCrankPlanV16, AutoCrankWorkV16, EngineAssetSlotV16Account, LiquidationRequestV16, Market, MarketGroupV16HeaderAccount,
@@ -13,18 +16,35 @@ use percolator::{
     ProvenanceHeaderV16Account, SideV16, TradeRequestV16, V16Config, V16Error,
 };
 
-// Single-threaded global storage (wasm has one thread; native tests run this crate's
-// state behind `&mut Sim`, and only the C ABI below touches these cells).
-struct Cell<T>(UnsafeCell<T>);
-unsafe impl<T> Sync for Cell<T> {}
-static SNAP: Cell<Option<Sim>> = Cell(UnsafeCell::new(None));
-static SIM: Cell<Option<Sim>> = Cell(UnsafeCell::new(None));
+// Browser exports are single-threaded. Native simulations and C ABI callers use
+// thread-local scratch/state so independent threads never alias a mutable buffer.
 const OUT_CAP: usize = 32 * 1024;
+#[cfg(target_arch = "wasm32")]
+struct Cell<T>(UnsafeCell<T>);
+#[cfg(target_arch = "wasm32")]
+unsafe impl<T> Sync for Cell<T> {}
+#[cfg(target_arch = "wasm32")]
+static SNAP: Cell<Option<Sim>> = Cell(UnsafeCell::new(None));
+#[cfg(target_arch = "wasm32")]
+static SIM: Cell<Option<Sim>> = Cell(UnsafeCell::new(None));
+#[cfg(target_arch = "wasm32")]
 static OUT: Cell<([u8; OUT_CAP], usize)> = Cell(UnsafeCell::new(([0; OUT_CAP], 0)));
-
-#[allow(clippy::mut_from_ref)]
-fn snapshot_slot() -> &'static mut Option<Sim> {
-    unsafe { &mut *SNAP.0.get() }
+#[cfg(not(target_arch = "wasm32"))]
+std::thread_local! {
+    static SNAP: RefCell<Option<Sim>> = const { RefCell::new(None) };
+    static SIM: RefCell<Option<Sim>> = const { RefCell::new(None) };
+    static OUT: RefCell<([u8; OUT_CAP], usize)> = const { RefCell::new(([0; OUT_CAP], 0)) };
+}
+macro_rules! with_cell {
+    ($cell:ident, $f:expr) => {{
+        #[cfg(target_arch = "wasm32")]
+        { ($f)(unsafe { &mut *$cell.0.get() }) }
+        #[cfg(not(target_arch = "wasm32"))]
+        { $cell.with(|cell| ($f)(&mut *cell.borrow_mut())) }
+    }};
+}
+fn with_snapshot<R>(f: impl FnOnce(&mut Option<Sim>) -> R) -> R {
+    with_cell!(SNAP, f)
 }
 
 pub const ASSETS: usize = 6;
@@ -125,9 +145,9 @@ impl Sim {
     /// Engine calls are documented as non-atomic: an `Err` must be rolled back by the
     /// caller, the way the SVM rolls back a failed transaction. We snapshot and restore.
     fn tx<R>(&mut self, f: impl FnOnce(&mut Sim) -> Result<R, V16Error>) -> Option<R> {
-        let snap = snapshot_slot();
-        *snap = Some(*self);
-        match f(self) {
+        with_snapshot(|snap| {
+            *snap = Some(*self);
+            match f(self) {
             Ok(r) => {
                 self.last_error = "";
                 Some(r)
@@ -139,7 +159,8 @@ impl Sim {
                 self.last_error = err_name(e);
                 None
             }
-        }
+            }
+        })
     }
 
     pub fn deposit(&mut self, acct: usize, amount: u128) -> bool {
@@ -386,16 +407,17 @@ impl Sim {
         let _ = o.write_str("],\"accounts\":[");
         for a in 0..ACCOUNTS {
             // Health is read on a scratch copy so viewing never mutates engine state.
-            let scratch = snapshot_slot();
-            *scratch = Some(*self);
-            let cert = match scratch.as_mut() {
+            let cert = with_snapshot(|scratch| {
+                *scratch = Some(*self);
+                match scratch.as_mut() {
                 Some(sc) => {
                     let mut market = MarketGroupV16ViewMut::new(&mut sc.header, &mut sc.markets);
                     let mut p = PortfolioV16ViewMut::new(&mut sc.accounts[a]);
                     market.full_account_refresh_not_atomic(&mut p)
                 }
                 None => Err(V16Error::InvalidConfig),
-            };
+                }
+            });
             let (eq, im, mm, ok) = match cert {
                 Ok(c) => (c.certified_equity, c.certified_initial_req, c.certified_maintenance_req, true),
                 Err(_) => (0, 0, 0, false),
@@ -420,23 +442,25 @@ impl Sim {
 struct Buf;
 impl Write for Buf {
     fn write_str(&mut self, s: &str) -> core::fmt::Result {
-        let (buf, len) = unsafe { &mut *OUT.0.get() };
-        let b = s.as_bytes();
-        if *len + b.len() > OUT_CAP { return Err(core::fmt::Error); }
-        buf[*len..*len + b.len()].copy_from_slice(b);
-        *len += b.len();
-        Ok(())
+        with_cell!(OUT, |out: &mut ([u8; OUT_CAP], usize)| {
+            let (buf, len) = out;
+            let b = s.as_bytes();
+            if *len + b.len() > OUT_CAP { return Err(core::fmt::Error); }
+            buf[*len..*len + b.len()].copy_from_slice(b);
+            *len += b.len();
+            Ok(())
+        })
     }
 }
 
 fn with<R>(d: R, f: impl FnOnce(&mut Sim) -> R) -> R {
-    match unsafe { &mut *SIM.0.get() }.as_mut() { Some(sim) => f(sim), None => d }
+    with_cell!(SIM, |slot: &mut Option<Sim>| match slot.as_mut() { Some(sim) => f(sim), None => d })
 }
 
 #[no_mangle]
 pub extern "C" fn sim_init(p0: u64, p1: u64, p2: u64, p3: u64, p4: u64, p5: u64, im_bps: u64, mm_bps: u64, liq_bps: u64, max_move_bps: u64) -> i32 {
     match Sim::new([p0, p1, p2, p3, p4, p5], im_bps, mm_bps, liq_bps, max_move_bps) {
-        Ok(s) => { unsafe { *SIM.0.get() = Some(s) }; 1 }
+        Ok(s) => { with_cell!(SIM, |slot: &mut Option<Sim>| *slot = Some(s)); 1 }
         Err(_) => 0,
     }
 }
@@ -463,12 +487,12 @@ pub extern "C" fn sim_convert(acct: u32) -> i32 { with(0, |s| s.convert_pnl(acct
 /// Serialises state to JSON in a static buffer; returns its address. Length via `sim_state_len`.
 #[no_mangle]
 pub extern "C" fn sim_state() -> *const u8 {
-    unsafe { (*OUT.0.get()).1 = 0 };
+    with_cell!(OUT, |out: &mut ([u8; OUT_CAP], usize)| out.1 = 0);
     with((), |s| s.write_state(&mut Buf));
-    unsafe { (*OUT.0.get()).0.as_ptr() }
+    with_cell!(OUT, |out: &mut ([u8; OUT_CAP], usize)| out.0.as_ptr())
 }
 #[no_mangle]
-pub extern "C" fn sim_state_len() -> u32 { unsafe { (*OUT.0.get()).1 as u32 } }
+pub extern "C" fn sim_state_len() -> u32 { with_cell!(OUT, |out: &mut ([u8; OUT_CAP], usize)| out.1 as u32) }
 
 #[cfg(target_arch = "wasm32")]
 mod rt {
@@ -483,4 +507,56 @@ mod rt {
     static A: NoHeap = NoHeap;
     #[panic_handler]
     fn panic(_: &core::panic::PanicInfo) -> ! { core::arch::wasm32::unreachable() }
+}
+
+#[cfg(test)]
+mod concurrency_tests {
+    use super::*;
+    use std::sync::{Arc, Barrier};
+
+    #[test]
+    fn independent_transactions_keep_their_own_rollback_snapshot() {
+        let barrier = Arc::new(Barrier::new(4));
+        let threads: Vec<_> = (0..4).map(|i| {
+            let barrier = barrier.clone();
+            std::thread::spawn(move || {
+                let mut sim = Sim::new([100_000_000; ASSETS], 1000, 500, 50, 400).unwrap();
+                let amount = (i + 1) * 1_000_000u128;
+                assert!(sim.deposit(0, amount));
+                let result: Option<()> = sim.tx(|s| {
+                    // Every thread has captured a different snapshot before any rolls back.
+                    barrier.wait();
+                    s.deposited = 0;
+                    Err(V16Error::InvalidConfig)
+                });
+                assert!(result.is_none());
+                assert_eq!(sim.deposited, amount);
+                assert_eq!(sim.invariants(), (true, true, true));
+                let mut state = String::new();
+                sim.write_state(&mut state);
+                assert!(state.contains(&format!("\"deposited\":\"{}\"", amount)));
+            })
+        }).collect();
+        for thread in threads { thread.join().unwrap(); }
+    }
+
+    #[test]
+    fn native_abi_state_and_output_are_isolated_per_thread() {
+        let barrier = Arc::new(Barrier::new(4));
+        let threads: Vec<_> = (0..4).map(|i| {
+            let barrier = barrier.clone();
+            std::thread::spawn(move || {
+                assert_eq!(sim_init(100_000_000, 100_000_000, 100_000_000, 100_000_000, 100_000_000, 100_000_000, 1000, 500, 50, 400), 1);
+                let amount = (i + 1) * 1_000_000;
+                assert_eq!(sim_deposit(0, amount), 1);
+                barrier.wait();
+                let ptr = sim_state();
+                barrier.wait();
+                let state = unsafe { std::slice::from_raw_parts(ptr, sim_state_len() as usize) };
+                let state = std::str::from_utf8(state).unwrap();
+                assert!(state.contains(&format!("\"deposited\":\"{}\"", amount)));
+            })
+        }).collect();
+        for thread in threads { thread.join().unwrap(); }
+    }
 }

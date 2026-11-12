@@ -1,0 +1,28 @@
+name: sim-tests
+on:
+  pull_request:
+    paths: ["sim/**", "engine/**", ".github/workflows/sim-tests.yml"]
+  push:
+    branches: [main]
+    paths: ["sim/**", "engine/**", ".github/workflows/sim-tests.yml"]
+permissions:
+  contents: read
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Install Rust and WASM target
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+          rustup target add wasm32-unknown-unknown
+      - name: Native wrapper and concurrency tests
+        run: cargo test --manifest-path sim/Cargo.toml
+      - name: Build browser wrapper
+        run: cargo build --manifest-path sim/Cargo.toml --release --target wasm32-unknown-unknown --lib
+      - name: WASM ABI smoke test
+        run: node sim/tests/wasm-smoke.cjs

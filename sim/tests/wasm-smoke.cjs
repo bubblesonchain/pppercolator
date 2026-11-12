@@ -1,0 +1,22 @@
+const assert = require('node:assert/strict');
+const { readFileSync } = require('node:fs');
+const { resolve } = require('node:path');
+(async () => {
+  const bytes = readFileSync(resolve(__dirname, '../target/wasm32-unknown-unknown/release/sim.wasm'));
+  const w = (await WebAssembly.instantiate(bytes, {})).instance.exports;
+  const prices = [100n,80000n,3000n,150n,300n,200n].map(x=>x*1000000n);
+  const state = () => JSON.parse(new TextDecoder().decode(new Uint8Array(w.memory.buffer,w.sim_state(),w.sim_state_len())));
+  assert.equal(w.sim_init(...prices,1000n,500n,50n,400n),1);
+  assert.equal(w.sim_deposit(0,1000000000n),1);
+  assert.equal(w.sim_deposit(7,1000000000000n),1);
+  assert.equal(w.sim_trade(0,0,1000000n,10n),1);
+  const before=state();
+  const invalid=prices.slice();invalid[0]*=2n;
+  assert.equal(w.sim_tick(...invalid),0);
+  const after=state();delete before.err;delete after.err;
+  assert.deepEqual(after,before);
+  assert.equal(w.sim_trade(0,0,-1000000n,10n),1);
+  assert.equal(state().accounts[0].pos[0],'0');
+  assert.deepEqual(state().inv,{conserved:true,covered:true,shape:true});
+  console.log('WASM ABI: initialization, trade, rollback, close and invariants passed');
+})().catch(e=>{console.error(e);process.exitCode=1});
