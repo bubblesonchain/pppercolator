@@ -323,7 +323,7 @@ input[type=file]{width:100%;font-size:12px}
         <div><label for="pic">Or upload your own logo</label><input type="file" id="pic" accept="image/*"></div>
         <div><label for="buy">Your first buy in SOL (optional)</label><input type="text" id="buy" inputmode="decimal" value="0" style="max-width:140px" autocomplete="off"></div>
         <div class="card in"><div class="face" id="pvFace"></div><div style="min-width:0"><b id="pvName"></b><small id="pvSym"></small><div style="margin-top:4px"><span class="tagp" id="pvTag"></span> <span class="tagp" style="background:var(--title-a)">CEO: you</span></div><p class="lead" id="pvNote" style="font-size:12px;margin-top:4px"></p></div></div>
-        <div class="row"><button class="btn go" type="submit">Go public (IPO)</button><button class="btn" type="button" id="reroll">New name</button></div>
+        <div class="row"><button class="btn go" type="submit" id="launchSubmit">Go public (IPO)</button><button class="btn" type="button" id="reroll">New name</button></div>
         <p id="status" role="status"></p>
       </form>
       <div class="sbar">Any name works, but each name and symbol can only be launched once. The stock link cannot be changed after launch.</div>
@@ -601,7 +601,7 @@ in 256 colours.</div></div>
   }
   async function api(body){
     var r=await fetch(FN,{method:"POST",headers:{"Content-Type":"application/json","Authorization":"Bearer "+ANON,"apikey":ANON},body:JSON.stringify(body)});
-    var j=await r.json().catch(function(){return{};});if(!r.ok)throw new Error(j.error||("launch desk error "+r.status));return j;
+    var j=await r.json();if(!r.ok||j?.error)throw new Error(j?.error||("launch desk error "+r.status));if(!j||typeof j!=="object")throw new Error("Invalid launch desk response");return j;
   }
   async function loadCompanies(){
     try{
@@ -615,42 +615,63 @@ in 256 colours.</div></div>
   async function goPublic(){
     var W=window.solanaWeb3;
     if(!W){say("The wallet library did not load. Reload the page and try again.");return;}
-    var name=$("coName").value.trim(),symbol=$("coSym").value.trim().toUpperCase(),buy=Math.max(0,Math.min(5,parseFloat($("buy").value)||0));
+    var wallet=prov(),creator=pk,version=walletVersion;
+    function checkWallet(){if(version!==walletVersion||pk!==creator||prov()!==wallet||wallet.publicKey?.toString()!==creator)throw new Error("Wallet changed. Reconnect and review the launch again");}
+    var name=$("coName").value.trim(),symbol=$("coSym").value.trim().toUpperCase(),raw=$("buy").value.trim()||"0",buy=Number(raw);
+    if(!/^(?:\d+(?:\.\d*)?|\.\d+)$/.test(raw)||!Number.isFinite(buy)||buy<0||buy>5){say("Enter a first buy between 0 and 5 SOL.");return;}
+    var stock=sel.value,mascot=MASCOTS[m][0],image=logoData();
     var yes=await confirmBox("This creates a REAL coin on Pump.fun mainnet: "+name+" ($"+symbol+"). Your wallet pays the network cost plus a first buy of "+buy+" SOL. It cannot be undone. Continue?");
     if(!yes)return;
-    var mint=W.Keypair.generate(),mintStr=mint.publicKey.toBase58(),sent=false;
+    var mint=W.Keypair.generate(),mintStr=mint.publicKey.toBase58(),submitted=false,signature=null;
     try{
+      checkWallet();
       say("Filing the paperwork...");
-      var p=await api({action:"prepare",name:name,symbol:symbol,stock:sel.value,mascot:MASCOTS[m][0],creator:pk,mint:mintStr,buy:buy,image:logoData()});
+      var p=await api({action:"prepare",name:name,symbol:symbol,stock:stock,mascot:mascot,creator:creator,mint:mintStr,buy:buy,image:image});
+      checkWallet();
       var tx=W.VersionedTransaction.deserialize(Uint8Array.from(atob(p.tx),function(ch){return ch.charCodeAt(0);}));
+      var signers=tx.message.staticAccountKeys.slice(0,tx.message.header.numRequiredSignatures).map(function(key){return key.toString();});
+      if(signers[0]!==creator||!signers.includes(mintStr)||signers.some(function(key){return key!==creator&&key!==mintStr;}))throw new Error("Unexpected transaction signers from launch desk");
       tx.sign([mint]);
       say("Check your wallet and approve the launch.");
-      var out=await prov().signAndSendTransaction(tx);sent=true;
-      await api({action:"confirm",mint:mintStr,creator:pk,signature:out.signature}).catch(function(){});
-      say("You are public. "+name+" is on Pump.fun at pump.fun/coin/"+mintStr);loadCompanies();
+      submitted=true;
+      var out=await wallet.signAndSendTransaction(tx);signature=out?.signature;
+      if(typeof signature!=="string"||!signature)throw new Error("No transaction signature returned");
+      await api({action:"confirm",mint:mintStr,creator:creator,signature:signature});
+      say("Launch submitted and recorded. Verify the transaction in your wallet before trading. Mint: "+mintStr+". Signature: "+signature);loadCompanies();
     }catch(err){
-      if(!sent)api({action:"cancel",mint:mintStr,creator:pk}).catch(function(){});
-      say(sent?"The launch was sent, but listing it here failed. Check your wallet history.":"Launch stopped: "+((err&&err.message)||"nothing was sent")+".");
+      if(!submitted)api({action:"cancel",mint:mintStr,creator:creator}).catch(function(){});
+      say(submitted?"Launch outcome is unconfirmed. Check your wallet history before retrying. Mint: "+mintStr+(signature?". Signature: "+signature:""):"Launch stopped: "+((err&&err.message)||"nothing was sent")+".");
     }
   }
   loadCompanies();
 
   /* wallet */
-  var pk=null;
+  var pk=null,walletVersion=0,walletProvider=null,launchBusy=false;
   function prov(){return window.solana||(window.phantom&&window.phantom.solana);}
+  function clearWallet(){pk=null;walletVersion++;$("walletTxt").textContent="not connected";$("connectBtn").textContent="Connect wallet";}
+  function walletAccountChanged(key){if(pk&&key?.toString()!==pk)clearWallet();}
+  function watchWallet(p){
+    if(walletProvider===p)return;
+    if(walletProvider?.removeListener){walletProvider.removeListener("accountChanged",walletAccountChanged);walletProvider.removeListener("disconnect",clearWallet);}
+    walletProvider=p;p.on?.("accountChanged",walletAccountChanged);p.on?.("disconnect",clearWallet);
+  }
   async function connect(){
     var p=prov();
     if(!p||!p.isPhantom){$("walletTxt").textContent="no Solana wallet found in this browser";return false;}
-    try{var r=await p.connect();pk=r.publicKey.toString();$("walletTxt").textContent=pk.slice(0,4)+"..."+pk.slice(-4);$("connectBtn").textContent="Disconnect";return true;}catch(e){return false;}
+    watchWallet(p);var version=walletVersion;
+    try{var r=await p.connect();if(version!==walletVersion||p!==prov()||r.publicKey.toString()!==p.publicKey?.toString())return false;pk=r.publicKey.toString();walletVersion++;$("walletTxt").textContent=pk.slice(0,4)+"..."+pk.slice(-4);$("connectBtn").textContent="Disconnect";return true;}catch(e){return false;}
   }
   $("connectBtn").addEventListener("click",async function(){
-    if(pk){try{await prov().disconnect();}catch(e){}pk=null;$("walletTxt").textContent="not connected";this.textContent="Connect wallet";}else{await connect();}
+    if(pk){var p=prov();clearWallet();try{await p.disconnect();}catch(e){}}else{await connect();}
   });
   $("launchForm").addEventListener("submit",async function(e){
-    e.preventDefault();var st=$("status");
+    e.preventDefault();if(launchBusy)return;
     if(!$("coName").value.trim()||!$("coSym").value.trim()){say("Your company needs a name and a symbol.");return;}
-    if(!pk){var ok=await connect();if(!ok){say("No Solana wallet found. Install Phantom to go public.");return;}}
-    goPublic();
+    launchBusy=true;$("launchSubmit").disabled=true;
+    try{
+      if(!pk){var ok=await connect();if(!ok){say("Connect a Solana wallet to go public.");return;}}
+      await goPublic();
+    }finally{launchBusy=false;$("launchSubmit").disabled=false;}
   });
   /* guide: Benny the broker explains the launchpad, step by step and per window */
   (function(){

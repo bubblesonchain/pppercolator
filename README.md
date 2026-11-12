@@ -50,4 +50,11 @@ It is a memecoin, gives no claim on this project, and is not connected to the Pe
 cd sim && cargo test
 ```
 
+Terminal, wallet-session and launch-flow tests (Node.js 22+, wallet and exchange calls are mocked):
+
+```bash
+npm ci --prefix hl --ignore-scripts --no-audit --no-fund
+node --test web/tests/*.test.cjs hl/tests/*.test.mjs launchpad/tests/*.test.cjs
+```
+
 Not affiliated with or endorsed by the Percolator author.

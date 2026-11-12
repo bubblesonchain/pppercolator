@@ -1,0 +1,21 @@
+name: web-tests
+on:
+  pull_request:
+    paths: ["web/**", "hl/**", "dist/hl.js*", "launchpad/**", "site/index.html", ".github/workflows/web-tests.yml"]
+  push:
+    branches: [main]
+    paths: ["web/**", "hl/**", "dist/hl.js*", "launchpad/**", "site/index.html", ".github/workflows/web-tests.yml"]
+permissions:
+  contents: read
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Install pinned trading-client dependencies
+        run: npm ci --prefix hl --ignore-scripts --no-audit --no-fund
+      - name: Trading and launch regression tests
+        run: node --test web/tests/*.test.cjs hl/tests/*.test.mjs launchpad/tests/*.test.cjs

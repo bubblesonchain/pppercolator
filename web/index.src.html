@@ -214,14 +214,17 @@ const WASM_B64="__WASM__";
 const MK=[["SOL",82,"","SOL"],["BTC",73000,"","BTC"],["ETH",2000,"","ETH"],["NVDA",170,"xyz","xyz:NVDA"],["TSLA",377,"xyz","xyz:TSLA"],["AAPL",347,"xyz","xyz:AAPL"]];
 const HL="https://api.hyperliquid.xyz/info";let info=MK.map(()=>null),realC=MK.map(()=>null),realAt=MK.map(()=>0);
 let live=false,latest=null,closed=[],poll=null,lastOk=0;
-const U=1e6,BOTS=[1,2,3,4,5,6],TRADERS=7;
+const U=1e6,BOTS=[1,2,3,4,5,6],TRADERS=7,PRICE_MAX_AGE_MS=15000;
 let w,rnd,seed,tick=0,sel=0,side=1,paused=false,halted=false,acts=[],px=[],open0=[],nLiq=0,nRef=0,checks=0,timer=null,S=null;
 let candles=[],entry=[0,0,0,0,0,0];
 // Real mode: orders go from this browser to Hyperliquid, signed by a trading-only key the user approved. Beta.
-const REAL_ON=!!window.PPPHL,BUILDER="0x4bf1b0952d7011e6b6768ef4af4255a6534c0298",BUILDER_F=30;let real=false,RA=null,pending=null,builderOk=false,builderLive=false;const CANDLE=4,MM=0.05;
+const REAL_ON=!!window.PPPHL,BUILDER="0x4bf1b0952d7011e6b6768ef4af4255a6534c0298",BUILDER_F=30;let real=false,RA=null,pending=null,builderOk=false,builderLive=false,submitting=false,realAtMs=0,refreshId=0;const CANDLE=4,MM=0.05;
 const $=id=>document.getElementById(id);
 const fmt=(n,d=2)=>n.toLocaleString("en-US",{minimumFractionDigits:d,maximumFractionDigits:d});
 const usd=s=>"$"+fmt(Number(s)/U);
+function pricesFresh(at=lastOk){return live&&at>0&&Date.now()-at<=PRICE_MAX_AGE_MS}
+function accountFresh(){return RA&&realAtMs>0&&Date.now()-realAtMs<=PRICE_MAX_AGE_MS}
+function marketPrice(i){return real&&latest?latest[i]:px[i]}
 function mulberry(a){return function(){a|=0;a=a+0x6D2B79F5|0;let t=Math.imul(a^a>>>15,1|a);t=t+Math.imul(t^t>>>7,61|t)^t;return((t^t>>>14)>>>0)/4294967296}}
 function state(){const p=w.sim_state(),n=w.sim_state_len();return JSON.parse(new TextDecoder().decode(new Uint8Array(w.memory.buffer,p,n)))}
 function log(t,c){const l=$("log"),d=document.createElement("div");if(c)d.className=c;d.textContent=String(tick).padStart(5,"0")+"  "+t;l.prepend(d);while(l.childElementCount>120)l.lastChild.remove()}
@@ -308,12 +311,12 @@ function liqEst(A,i,q){const E=Number(A.equity)/U,m=px[i]/U,qq=q/U,otherMM=Numbe
 function ticket(){
   const A=S.accounts[0],free=real?(RA?parseFloat(RA.withdrawable):0):Math.max(0,(Number(A.equity)-Number(A.im))/U),lev=+$("lev").value,m=amount();
   $("levv").textContent=lev+"x";$("maxm").textContent="free $"+fmt(free,0);
-  const not=m*lev,units=not/(px[sel]/U);
+  const not=m*lev,units=not/(marketPrice(sel)/U);
   $("oSize").textContent=fmt(units,units>=100?1:4)+" "+MK[sel][0];$("oNot").textContent="$"+fmt(not,0);
-  const mark=px[sel]/U,liq=lev>1?(side>0?mark*(1-1/lev)/(1-MM):mark*(1+1/lev)/(1+MM)):0;
+  const mark=marketPrice(sel)/U,liq=lev>1?(side>0?mark*(1-1/lev)/(1-MM):mark*(1+1/lev)/(1+MM)):0;
   $("oLiq").textContent=m&&liq>0&&(side<0||liq<mark)?"$"+fmt(liq,mark>=1000?0:2):"n/a";
   const g=$("bGo");g.className=side>0?"long":"short";g.textContent=(real?"Review ":"Open ")+(side>0?"long ":"short ")+MK[sel][0];
-  if(real){const stock=MK[sel][2]==="xyz";g.disabled=stock||!PPPHL.hasAgent();g.style.opacity=g.disabled?.45:1;if(stock)g.textContent="Stock perps are paper only for now"}else{g.disabled=false;g.style.opacity=1}
+  if(real){const stock=MK[sel][2]==="xyz";g.disabled=stock||submitting||!PPPHL.hasAgent()||!pricesFresh()||!accountFresh();g.style.opacity=g.disabled?.45:1;if(stock)g.textContent="Stock perps are paper only for now";else if(submitting)g.textContent="Order in progress";else if(!pricesFresh())g.textContent="Waiting for fresh prices";else if(!accountFresh())g.textContent="Waiting for account data"}else{g.disabled=false;g.style.opacity=1}
   $("sLong").className="long"+(side>0?" on":"");$("sShort").className="short"+(side<0?" on":"");
 }
 function renderReal(){
@@ -327,32 +330,51 @@ function renderReal(){
   const av=RA?parseFloat(RA.accountValue):0,wd=RA?parseFloat(RA.withdrawable):0,mu=RA?parseFloat(RA.marginUsed):0;
   $("eq").textContent="$"+fmt(av);$("free").textContent="$"+fmt(wd);$("im").textContent="$"+fmt(mu);const up=$("upnl");up.textContent=sgn(upnl);up.className=upnl>0?"up":upnl<0?"down":"";
 }
-async function refreshReal(){if(!real||!PPPHL.user())return;try{RA=await PPPHL.account()}catch(e){}
-  if(BUILDER&&!builderOk){try{builderOk=(await PPPHL.maxBuilderFee(BUILDER))>=BUILDER_F}catch(e){}}
-  const u=PPPHL.user();$("rStat").textContent=u?("Wallet "+u.slice(0,6)+"..."+u.slice(-4)+(PPPHL.hasAgent()?". Trading enabled in this browser.":". Enable trading to place orders: one signature, it creates a trading-only key that cannot withdraw.")+(RA&&parseFloat(RA.accountValue)<10?" Your Hyperliquid balance is under $10. Deposit USDC at app.hyperliquid.xyz first.":"")):"Not connected.";
-  $("bConn").hidden=!!u;$("bEnable").hidden=!u||PPPHL.hasAgent();$("bOff").hidden=!PPPHL.hasAgent();render()}
-function setMode(r){real=r;pending=null;$("confirm").hidden=true;$("realBox").hidden=!r;$("mPaper").className="long"+(r?"":" on");$("mReal").className="long"+(r?" on":"");
+function walletChanged(){
+  refreshId++;RA=null;realAtMs=0;builderOk=false;pending=null;$("confirm").hidden=true;
+  $("rStat").textContent=PPPHL.user()?"Wallet session updated. Refreshing account...":"Wallet disconnected or changed. Connect again to trade.";
+  $("bConn").hidden=!!PPPHL.user();$("bEnable").hidden=!PPPHL.user()||PPPHL.hasAgent();$("bOff").hidden=!PPPHL.hasAgent();
+  if(real&&S){render();refreshReal()}
+}
+if(REAL_ON)window.addEventListener("ppp:wallet-change",walletChanged);
+async function refreshReal(){
+  if(!real||!PPPHL.user())return;
+  const id=++refreshId,u=PPPHL.user(),session=PPPHL.session();
+  const current=()=>real&&id===refreshId&&u===PPPHL.user()&&session===PPPHL.session();
+  let error="";
+  try{const next=await PPPHL.account();if(!current())return;RA=next;realAtMs=Date.now()}
+  catch(e){if(!current())return;realAtMs=0;error=" Account data unavailable; opening orders is paused."}
+  if(BUILDER&&!builderOk){try{const fee=await PPPHL.maxBuilderFee(BUILDER);if(!current())return;builderOk=fee>=BUILDER_F}catch(e){}}
+  if(!current())return;
+  $("rStat").textContent="Wallet "+u.slice(0,6)+"..."+u.slice(-4)+(PPPHL.hasAgent()?". Trading enabled in this browser.":". Enable trading to place orders: one signature, it creates a trading-only key that cannot withdraw.")+error+(RA&&parseFloat(RA.accountValue)<10?" Your Hyperliquid balance is under $10. Deposit USDC at app.hyperliquid.xyz first.":"");
+  $("bConn").hidden=true;$("bEnable").hidden=PPPHL.hasAgent();$("bOff").hidden=!PPPHL.hasAgent();render()
+}
+function setMode(r){real=r;refreshId++;pending=null;$("confirm").hidden=true;$("realBox").hidden=!r;$("mPaper").className="long"+(r?"":" on");$("mReal").className="long"+(r?" on":"");
   $("mchip").textContent=r?"real money, Hyperliquid":"paper money";$("feeLbl").textContent=r?"real, 0.03% site fee":"paper, 0.10% fee";$("brk").hidden=r||live;$("bMode").hidden=r;$("bShare").hidden=r||live;
   $("posEmpty").textContent="No open positions. Pick a market, set margin and leverage, and open one.";
   $("msg").textContent=r?"Real mode sends real orders to Hyperliquid from your own wallet. This site never holds your funds. Not available to US persons. Start small.":"Paper mode. Nothing here uses real funds.";
-  if(r)refreshReal();else render()}
+  render();if(r)refreshReal()}
 function review(o){
+  if(submitting){$("msg").textContent="An order is already in progress. Wait for its result.";return}
   if(!PPPHL.hasAgent()){$("msg").textContent="Connect your wallet and enable trading first.";return}
-  pending=o;const p=px[MK.findIndex(m=>m[3]===o.coin)]/U||0,not=o.size*p,fee=BUILDER&&builderOk&&builderLive?not*BUILDER_F/100000:0;
+  if(!o.close&&!pricesFresh()){$("msg").textContent="Live prices are stale. Wait for fresh prices before opening an order.";return}
+  if(!o.close&&!accountFresh()){$("msg").textContent="Wait for fresh account data before opening an order.";return}
+  const builder=BUILDER&&builderOk&&builderLive?{b:BUILDER,f:BUILDER_F}:null;
+  pending={...o,quotedAt:lastOk,user:PPPHL.user(),session:PPPHL.session(),builder};const p=marketPrice(MK.findIndex(m=>m[3]===o.coin))/U||0,not=o.size*p,fee=builder?not*builder.f/100000:0;
   $("cText").textContent=(o.close?"CLOSE ":"")+(o.isBuy?"BUY ":"SELL ")+fmt(o.size,4)+" "+o.coin+" at market on Hyperliquid. About $"+fmt(not,0)+" notional"+(o.close?"":" at "+o.lev+"x cross")+". Up to 1% slippage."+(fee?" Site fee about $"+fmt(fee)+".":" No site fee.")+" This is a real order.";
   $("confirm").hidden=false}
 function render(){
   S=state();const A=S.accounts[0];
   $("slot").textContent=S.slot;$("selname").textContent=MK[sel][0]+"-PERP";
-  const chOf=i=>live&&info[i]&&info[i].prev>0?(px[i]/U/info[i].prev-1)*100:(px[i]/open0[i]-1)*100;
-  const ch0=chOf(sel);$("bigpx").textContent=pf(px[sel]);const cg=$("chg");cg.textContent=(ch0>=0?"+":"")+fmt(ch0)+"%";cg.className=ch0>=0?"up":"down";
+  const chOf=i=>live&&info[i]&&info[i].prev>0?(marketPrice(i)/U/info[i].prev-1)*100:(marketPrice(i)/open0[i]-1)*100;
+  const ch0=chOf(sel);$("bigpx").textContent=pf(marketPrice(sel));const cg=$("chg");cg.textContent=(ch0>=0?"+":"")+fmt(ch0)+"%";cg.className=ch0>=0?"up":"down";
   const I=live?info[sel]:null;$("chgl").textContent=I?"24h":"session";
   $("hrs").textContent=I?"funding "+(I.funding>=0?"+":"")+(I.funding*100).toFixed(4)+"%/h   24h vol $"+(I.vol>=1e9?fmt(I.vol/1e9)+"B":fmt(I.vol/1e6,1)+"M"):"";
   $("src").textContent=live?"Hyperliquid mark price":"simulated";if(live)pullCandles(sel);
   $("mkch").textContent=live?"24h":"Session";const tb=$("mk");tb.textContent="";
   MK.forEach((m,i)=>{const tr=document.createElement("tr");if(i===sel)tr.className="sel";tr.tabIndex=0;
     const ch=chOf(i);
-    [m[0],pf(px[i]),(ch>=0?"+":"")+fmt(ch)+"%"].forEach((t,k)=>{const td=document.createElement("td");td.textContent=t;if(k===2)td.className=ch>=0?"up":"down";tr.appendChild(td)});
+    [m[0],pf(marketPrice(i)),(ch>=0?"+":"")+fmt(ch)+"%"].forEach((t,k)=>{const td=document.createElement("td");td.textContent=t;if(k===2)td.className=ch>=0?"up":"down";tr.appendChild(td)});
     tr.onclick=()=>{sel=i;render()};tr.onkeydown=e=>{if(e.key==="Enter"||e.key===" "){e.preventDefault();sel=i;render()}};tb.appendChild(tr)});
   if(real){renderReal();ticket();draw();return}
   const pb=$("pos");pb.textContent="";let n=0,upnl=0;
@@ -373,7 +395,7 @@ function render(){
 function draw(){
   const c=$("chart"),g=c.getContext("2d"),W=c.width,H=c.height,cs=getComputedStyle(document.documentElement);
   const tok=n=>cs.getPropertyValue(n).trim(),up=tok("--up"),down=tok("--down"),line=tok("--line"),dim=tok("--dim"),amber=tok("--amber");
-  g.clearRect(0,0,W,H);let d=candles[sel]||[];if(live&&realC[sel]){d=realC[sel].slice();const z=d[d.length-1],p=px[sel];d[d.length-1]={o:z.o,h:Math.max(z.h,p),l:Math.min(z.l,p),c:p}}if(!d.length)return;
+  g.clearRect(0,0,W,H);let d=candles[sel]||[];if(live&&realC[sel]){d=realC[sel].slice();const z=d[d.length-1],p=marketPrice(sel);d[d.length-1]={o:z.o,h:Math.max(z.h,p),l:Math.min(z.l,p),c:p}}if(!d.length)return;
   let lo=Math.min(...d.map(x=>x.l)),hi=Math.max(...d.map(x=>x.h));const e=entry[sel];if(e){lo=Math.min(lo,e);hi=Math.max(hi,e)}
   const pad=(hi-lo)*.1||hi*.002;lo-=pad;hi+=pad;
   const R=150,L=10,T=14,B=14,n=Math.max(d.length,40),cw=(W-L-R)/n,Y=v=>T+(hi-v)/(hi-lo)*(H-T-B);
@@ -389,21 +411,42 @@ function draw(){
 const hex=s=>Array.from(new TextEncoder().encode(s),b=>b.toString(16).padStart(2,"0")).join("");
 const unhex=h=>new TextDecoder().decode(new Uint8Array(h.match(/../g).map(x=>parseInt(x,16))));
 function shareHash(){return "r"+hex(JSON.stringify({s:seed,e:tick,a:acts}))}
-function readHash(){try{const h=location.hash.slice(1);if(h[0]!=="r"||h.length<8)return null;const o=JSON.parse(unhex(h.slice(1)));if(typeof o.s!=="number"||!Array.isArray(o.a)||o.e>20000)return null;return{seed:o.s,end:o.e,acts:o.a}}catch(e){return null}}
-function amount(){const v=parseFloat(String($("usd").value).replace(/[^0-9.]/g,""));return v>0?Math.min(v,5e5):0}
+function readHash(){try{
+  const h=location.hash.slice(1);if(h[0]!=="r"||h.length<8||h.length>500000||!/^r(?:[0-9a-f]{2})+$/i.test(h))return null;
+  const o=JSON.parse(unhex(h.slice(1)));
+  if(!o||!Number.isInteger(o.s)||o.s<0||o.s>0xffffffff||!Number.isInteger(o.e)||o.e<0||o.e>20000||!Array.isArray(o.a)||o.a.length>10000)return null;
+  let last=-1;
+  for(const a of o.a){
+    if(!Array.isArray(a)||a.length!==4)return null;
+    const [t,c,i,v]=a;
+    if(!Number.isInteger(t)||t<last||t<0||t>o.e||!Number.isInteger(i)||i<0||i>=MK.length||!Number.isFinite(v))return null;
+    if(c==="L"||c==="S"){if(v<=0||v>5e6)return null}
+    else if(c==="C"){if(v!==0)return null}
+    else if(c==="K"){if(![-30,-4,4].includes(v))return null}
+    else return null;
+    last=t;
+  }
+  return{seed:o.s,end:o.e,acts:o.a}
+}catch(e){return null}}
+function amount(){const raw=String($("usd").value).replace(/[$,\s]/g,"");if(!/^(?:\d+(?:\.\d*)?|\.\d+)$/.test(raw))return 0;const v=Number(raw);return Number.isFinite(v)&&v>0?Math.min(v,5e5):0}
 $("sLong").onclick=()=>{side=1;ticket()};$("sShort").onclick=()=>{side=-1;ticket()};
 $("usd").oninput=()=>{if(S)ticket()};$("lev").oninput=()=>{if(S)ticket()};
 $("bGo").onclick=()=>{const lev=+$("lev").value,v=amount()*lev;if(!v){$("msg").textContent="Enter the margin to use first.";return}
   if(!real){user([side>0?"L":"S",sel,v]);return}
   if(v<10){$("msg").textContent="Hyperliquid's minimum order is $10 notional.";return}
   if(RA&&amount()>parseFloat(RA.withdrawable)){$("msg").textContent="That is more margin than you have free on Hyperliquid.";return}
-  review({coin:MK[sel][3],isBuy:side>0,size:v/(px[sel]/U),lev})};
+  review({coin:MK[sel][3],isBuy:side>0,size:v/(marketPrice(sel)/U),lev})};
 $("bCancel").onclick=()=>{pending=null;$("confirm").hidden=true};
-$("bSend").onclick=async()=>{const o=pending;if(!o)return;pending=null;$("confirm").hidden=true;$("msg").textContent="Sending order to Hyperliquid...";
-  try{const b=BUILDER&&builderOk&&builderLive?{b:BUILDER,f:BUILDER_F}:null;const r=o.close?await PPPHL.closePosition(o.coin,b):await PPPHL.marketOrder({coin:o.coin,isBuy:o.isBuy,size:o.size,leverage:o.lev,builder:b});
-    $("msg").textContent=r.filled?"Filled "+r.totalSz+" "+o.coin+" at $"+r.avgPx+" on Hyperliquid.":"Order was not filled. Nothing was traded.";log("REAL "+(o.isBuy?"buy ":"sell ")+o.coin+(r.filled?" filled "+r.totalSz+" at $"+r.avgPx:" not filled"),"you")}
-  catch(e){$("msg").textContent="Hyperliquid rejected the order: "+e.message}
-  refreshReal()};
+$("bSend").onclick=async()=>{const o=pending;if(!o||submitting)return;pending=null;$("confirm").hidden=true;
+  if(!PPPHL.hasAgent()||o.user!==PPPHL.user()||o.session!==PPPHL.session()){$("msg").textContent="Wallet session changed. Review the order again.";return}
+  if(!o.close&&(!pricesFresh(o.quotedAt)||!accountFresh())){$("msg").textContent="This price quote or account data has expired. Review your order again once live data is fresh.";return}
+  submitting=true;ticket();$("msg").textContent="Sending order to Hyperliquid...";
+  try{const r=o.close?await PPPHL.closePosition(o.coin,o.builder):await PPPHL.marketOrder({coin:o.coin,isBuy:o.isBuy,size:o.size,leverage:o.lev,builder:o.builder,validUntil:o.quotedAt+PRICE_MAX_AGE_MS});
+    if(o.user!==PPPHL.user()||o.session!==PPPHL.session())return;
+    $("msg").textContent=r.filled?"Filled "+r.totalSz+" "+o.coin+" at $"+r.avgPx+" on Hyperliquid.":"Order result is unconfirmed. Check Hyperliquid orders and positions before retrying.";log("REAL "+(o.isBuy?"buy ":"sell ")+o.coin+(r.filled?" filled "+r.totalSz+" at $"+r.avgPx:" result unconfirmed"),"you")}
+  catch(e){if(o.user===PPPHL.user()&&o.session===PPPHL.session())$("msg").textContent="Order not confirmed: "+e.message}
+  finally{submitting=false;realAtMs=0;if(S)ticket();refreshReal()}
+};
 $("bConn").onclick=async()=>{try{$("rStat").textContent="Waiting for your wallet...";await PPPHL.connect();await refreshReal()}catch(e){$("rStat").textContent=e.message}};
 $("bEnable").onclick=async()=>{try{$("rStat").textContent="Approve the trading key in your wallet...";await PPPHL.enableTrading();if(BUILDER&&!builderOk){try{await PPPHL.approveBuilder(BUILDER,(BUILDER_F/1000)+"%")}catch(e){}}await refreshReal()}catch(e){$("rStat").textContent="Not enabled: "+e.message}};
 $("bOff").onclick=()=>{PPPHL.disableTrading();refreshReal()};
@@ -430,12 +473,13 @@ $("bShare").onclick=async()=>{const h=shareHash();try{location.hash=h}catch(e){}
 async function getJSON(u){const c=new AbortController(),t=setTimeout(()=>c.abort(),5000);try{const r=await fetch(u,{signal:c.signal});if(!r.ok)throw new Error("HTTP "+r.status);return await r.json()}finally{clearTimeout(t)}}
 async function hl(body){const c=new AbortController(),t=setTimeout(()=>c.abort(),6000);try{const r=await fetch(HL,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(body),signal:c.signal});if(!r.ok)throw new Error("HTTP "+r.status);return await r.json()}finally{clearTimeout(t)}}
 async function pullPrices(){
-  const v=latest?latest.slice():MK.map(()=>0);
-  await Promise.allSettled(["","xyz"].map(dex=>hl(dex?{type:"metaAndAssetCtxs",dex}:{type:"metaAndAssetCtxs"}).then(m=>{
-    MK.forEach((k,i)=>{if(k[2]!==dex)return;const j=m[0].universe.findIndex(x=>x.name===k[3]);if(j<0)return;const c=m[1][j],p=parseFloat(c.markPx);
-      if(p>0){v[i]=Math.round(p*U);info[i]={funding:parseFloat(c.funding),vol:parseFloat(c.dayNtlVlm),prev:parseFloat(c.prevDayPx),maxLev:m[0].universe[j].maxLeverage}}})})));
-  if(!v.every(Boolean))throw new Error("missing price");
-  latest=v;lastOk=Date.now()
+  // Publish only a complete fresh snapshot; cached values must not advance lastOk.
+  const v=MK.map(()=>0),nextInfo=MK.map(()=>null);
+  await Promise.all(["","xyz"].map(dex=>hl(dex?{type:"metaAndAssetCtxs",dex}:{type:"metaAndAssetCtxs"}).then(m=>{
+    MK.forEach((k,i)=>{if(k[2]!==dex)return;const j=m[0].universe.findIndex(x=>x.name===k[3]);if(j<0)return;const c=m[1][j],p=Number(c.markPx);
+      if(Number.isFinite(p)&&p>0){v[i]=Math.round(p*U);nextInfo[i]={funding:parseFloat(c.funding),vol:parseFloat(c.dayNtlVlm),prev:parseFloat(c.prevDayPx),maxLev:m[0].universe[j].maxLeverage}}})})));
+  if(!v.every(p=>Number.isSafeInteger(p)&&p>0))throw new Error("missing or invalid price");
+  latest=v;info=nextInfo;lastOk=Date.now()
 }
 async function pullCandles(i){
   if(!live||Date.now()-realAt[i]<20000)return;realAt[i]=Date.now();
@@ -461,6 +505,6 @@ $("bMode").onclick=async()=>{
   if(!r&&!live)$("msg").textContent="Live prices could not be reached from this page, so prices are simulated. You start with $10,000 of paper money.";
   coin();fees();setInterval(()=>{if(!document.hidden){coin();fees()}},30000);
   if(REAL_ON){$("modeSeg").hidden=false;setInterval(()=>{if(!document.hidden)refreshReal()},4000)}
-  timer=setInterval(()=>{if(paused||halted||document.hidden)return;if(live&&Date.now()-lastOk>15000){$("pmode").textContent="live prices stalled";return}if(live)$("pmode").textContent="live prices";step();render()},900);
+  timer=setInterval(()=>{if(paused||halted||document.hidden)return;if(live&&!pricesFresh()){$("pmode").textContent="live prices stalled";ticket();return}if(live)$("pmode").textContent="live prices";step();render()},900);
 })().catch(e=>{$("msg").textContent="The engine failed to load in this browser: "+e.message});
 </script>
